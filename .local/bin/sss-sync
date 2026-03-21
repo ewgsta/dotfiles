@@ -1,0 +1,159 @@
+#!/bin/bash
+
+TARGET_PATH="/run/media/ewgsta/FDFF-F878"
+SOURCE_PATH="$HOME/Masaüstü/Shinda Sekai Sensen/"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+LOG_FILE="/tmp/sync_sd_$(date +%Y%m%d_%H%M%S).log"
+
+format_time() {
+    local s=$1
+    local h=$((s/3600)) m=$(((s%3600)/60)) sec=$((s%60))
+    [ $h -gt 0 ] && printf "%dh %02dm %02ds" $h $m $sec && return
+    [ $m -gt 0 ] && printf "%dm %02ds" $m $sec && return
+    printf "%ds" $sec
+}
+
+format_bytes() {
+    local b=$1
+    [ "$b" -ge $((1024*1024*1024)) ] && awk "BEGIN {printf \"%.2f GB\",$b/1073741824}" && return
+    [ "$b" -ge $((1024*1024))      ] && awk "BEGIN {printf \"%.2f MB\",$b/1048576}"    && return
+    [ "$b" -ge 1024                ] && awk "BEGIN {printf \"%.2f KB\",$b/1024}"       && return
+    echo "${b} B"
+}
+
+draw_bar() {
+    local pct=$1 file="$2" elapsed=$3 eta="$4" speed="$5"
+    local w=40 filled=$(( $1 * 40 / 100 ))
+    local bar=""
+    for ((i=0;i<filled;i++));  do bar+="█"; done
+    for ((i=filled;i<w;i++));  do bar+="░"; done
+
+    local short
+    short=$(basename "$file")
+    [ ${#short} -gt 50 ] && short="${short:0:47}..."
+
+    printf "\033[5A"
+    printf "\r%-55s\n"               "$short"
+    printf "\r[%s] %3d%%\n"          "$bar" "$pct"
+    printf "\r  Gecen : %-12s\n"     "$(format_time $elapsed)"
+    printf "\r  Kalan : %-12s\n"     "$eta"
+    printf "\r  Hiz   : %-15s\n"     "$speed"
+}
+
+if mountpoint -q "$TARGET_PATH"; then
+    echo -e "${GREEN}SD kart bagli.${NC}"
+else
+    echo -e "${RED}SD kart bulunamadi: $TARGET_PATH${NC}"
+    exit 1
+fi
+
+total_files=$(find "$SOURCE_PATH" -type f | wc -l)
+total_bytes=$(du -sb "$SOURCE_PATH" 2>/dev/null | awk '{print $1}')
+echo "Toplam: $total_files dosya, $(format_bytes $total_bytes)"
+echo ""
+
+printf "\n\n\n\n\n"
+
+start_time=$(date +%s)
+transferred=0 speed="" current_file=""
+created=0 deleted=0 transferred_size=0
+
+while IFS= read -r line; do
+    echo "$line" >> "$LOG_FILE"
+
+    if echo "$line" | grep -qE '^\s+[0-9,]+ +[0-9]+% +[0-9]+\.[0-9]+[kMG]B/s'; then
+        speed=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+[kMG]B/s' | head -1)
+        xferred=$(echo "$line" | awk '{gsub(/,/,"",$1); print $1}')
+        [ -n "$xferred" ] && transferred=$xferred
+    elif echo "$line" | grep -qE '^[^>].*\.[a-zA-Z0-9]+$'; then
+        current_file="$line"
+    elif echo "$line" | grep -q 'Number of created files:'; then
+        created=$(echo "$line" | grep -oE '[0-9,]+' | head -1 | tr -d ',')
+    elif echo "$line" | grep -q 'Number of deleted files:'; then
+        deleted=$(echo "$line" | grep -oE '[0-9,]+' | head -1 | tr -d ',')
+    elif echo "$line" | grep -q 'Total transferred file size:'; then
+        transferred_size=$(echo "$line" | grep -oE '[0-9,]+' | head -1 | tr -d ',')
+    fi
+
+    now=$(date +%s)
+    elapsed=$(( now - start_time ))
+    pct=0; eta="hesaplaniyor"
+
+    if [ "$total_bytes" -gt 0 ] && [ "$transferred" -gt 0 ]; then
+        pct=$(( transferred * 100 / total_bytes ))
+        [ $pct -gt 100 ] && pct=100
+        if [ "$elapsed" -gt 0 ]; then
+            rate=$(( transferred / elapsed ))
+            [ "$rate" -gt 0 ] && eta="$(format_time $(( (total_bytes - transferred) / rate )))" || eta="hesaplaniyor"
+            [ -z "$speed" ] && speed="$(format_bytes $rate)/s"
+        fi
+    fi
+
+    draw_bar "$pct" "$current_file" "$elapsed" "$eta" "$speed"
+
+done < <(rsync -av --delete --stats --progress "$SOURCE_PATH" "$TARGET_PATH" 2>&1)
+
+end_time=$(date +%s)
+total_elapsed=$(( end_time - start_time ))
+draw_bar 100 "Tamamlandi" "$total_elapsed" "0s" ""
+echo ""
+echo ""
+
+printf "%-22s %s\n" "Toplam dosya:"     "$total_files"
+printf "%-22s %s\n" "Toplam boyut:"     "$(format_bytes $total_bytes)"
+printf "%-22s %s\n" "Yeni olusturulan:" "$created"
+printf "%-22s %s\n" "Silinen:"          "$deleted"
+printf "%-22s %s\n" "Aktarilan boyut:"  "$(format_bytes ${transferred_size:-0})"
+printf "%-22s %s\n" "Sure:"             "$(format_time $total_elapsed)"
+echo ""
+
+echo "Butunluk kontrolu yapiliyor..."
+missing=() mismatch=() ok=0
+
+while IFS= read -r src; do
+    rel="${src#$SOURCE_PATH}"
+    dst="$TARGET_PATH/$rel"
+    if [ ! -f "$dst" ]; then
+        missing+=("$rel")
+    else
+        ss=$(stat -c%s "$src" 2>/dev/null || echo 0)
+        ds=$(stat -c%s "$dst" 2>/dev/null || echo 0)
+        [ "$ss" != "$ds" ] && mismatch+=("$rel  [kaynak: $(format_bytes $ss) / hedef: $(format_bytes $ds)]") || (( ok++ ))
+    fi
+done < <(find "$SOURCE_PATH" -type f | sort)
+
+echo -e "${GREEN}Dogru aktarilan: $ok dosya${NC}"
+
+if [ ${#missing[@]} -eq 0 ] && [ ${#mismatch[@]} -eq 0 ]; then
+    echo -e "${GREEN}Tum dosyalar eksiksiz.${NC}"
+else
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${RED}Eksik (${#missing[@]}):${NC}"
+        printf '  %s\n' "${missing[@]}"
+    fi
+    if [ ${#mismatch[@]} -gt 0 ]; then
+        echo -e "${YELLOW}Boyut uyusmazligi (${#mismatch[@]}):${NC}"
+        printf '  %s\n' "${mismatch[@]}"
+    fi
+
+    echo "Sorunlu dosyalar yeniden aktariliyor..."
+    for f in "${missing[@]}"; do
+        rsync -av "$SOURCE_PATH/$f" "$TARGET_PATH/$f" >> "$LOG_FILE" 2>&1 \
+            && echo -e "  ${GREEN}OK${NC} $f" \
+            || echo -e "  ${RED}HATA${NC} $f"
+    done
+    for entry in "${mismatch[@]}"; do
+        f=$(echo "$entry" | awk '{print $1}')
+        rsync -av "$SOURCE_PATH/$f" "$TARGET_PATH/$f" >> "$LOG_FILE" 2>&1 \
+            && echo -e "  ${GREEN}OK${NC} $f" \
+            || echo -e "  ${RED}HATA${NC} $f"
+    done
+fi
+
+echo ""
+echo "Log: $LOG_FILE"
